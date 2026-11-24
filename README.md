@@ -18,6 +18,8 @@
 │   ├── app/routers/resource.py  通用查询/导出/登记/动作接口
 │   ├── app/services/<key>.py    每个模块独立领域逻辑
 │   ├── app/services/base.py     共享服务骨架
+│   ├── app/core/login_convention.py 登录动作换名、来源约定与带依据告警
+│   ├── app/routers/login.py     登录约定/告警接口（固定路径先于通用路由）
 │   └── app/store.py          内存数据仓库与示例数据
 ├── .gitignore
 └── docker-compose.yml
@@ -46,6 +48,16 @@ npm run dev
 前端默认监听 `http://127.0.0.1:5173/`，dev server 不会自动打开浏览器，
 需要自己访问。`/api` 由 vite 代理到后端 `http://127.0.0.1:8000`。
 
+后端测试（无第三方测试框架，直接运行）：
+
+```bash
+cd backend
+.venv/bin/python tests/test_login_convention.py
+.venv/bin/python tests/test_ingest_pipeline.py
+.venv/bin/python tests/test_dedup_sample.py
+.venv/bin/python tests/test_mask_enrich.py
+```
+
 ## 业务模块
 
 | 模块 | 目录 | 业务对象 | 主要字段 |
@@ -72,6 +84,53 @@ npm run dev
 | 访问审计 | `audit_event` | 审计记录 | 记录编号、操作模块、操作人 |
 | 租户隔离 | `tenant_isolation` | 租户配置 | 租户编号、租户名称、日志来源 |
 | 格式适配 | `format_adapt` | 适配器配置 | 适配器编号、输入格式、输出格式 |
+
+## 登录动作换名与来源约定
+
+访问日志里的登录动作在不同来源中叫法不同（`LOGIN` / `SIGN_IN` / `verb` …），
+只靠字段改名不能说明语义相同。`backend/app/core/login_convention.py` 把三件事分开：
+
+1. **字段改名**：`renames` 声明旧字段名到规范字段名，`groups` 声明哪些字段承载动作值。
+2. **取值转换**：每个原动作值到 `LOGIN`/`LOGOUT`/`ACCESS` 的映射必须带可复核 `evidence`。
+3. **告警依据**：每条参与告警的事件保留原行、字段组、原值、转换依据和字段版本。
+
+硬性规则：
+
+- 只有 `生效中` 的来源约定参与判定；草稿约定给出 `INACTIVE`。
+- 缺转换依据的 `SIGN_IN` 导入即拒绝，分类时只留待核对，不默认成 `LOGIN`。
+- 普通请求方法（GET/POST…）不能通过字段改名变成 `LOGIN`/`LOGOUT`。
+- 同一原行两个字段给出不同动作值 → `CONFLICT`，两个原值都留在依据里，且不计入告警。
+- 未登记的新动作 → `UNKNOWN`，不因为字段名相同就参与告警。
+- 不同来源各自的约定独立生效：甲的 `verb=LOGIN` 是登录，乙的 `verb=LOGIN` 可能只是访问标签。
+- 更正按 `correction_id` 幂等，只重算该事件及其告警，不扫描同批其它来源。
+- 已送达告警的修正单独关联（`amendments`），恢复时原告警不重发、不重新计数，
+  应交付的修正不跳过；同一告警交班确认跨进程只允许一次（原子标记文件）。
+- 已确认告警按当时实际使用的字段版本重算，新版约定下的计数单独给出，
+  旧名字原行不能自动沿用成新告警。
+
+接口（固定路径排在通用 `/{module}` 之前）：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/login/conventions/validate` | 只核对转换表与依据，不导入 |
+| POST | `/api/login/conventions` | 导入来源约定（保留历史版本） |
+| GET | `/api/login/conventions` | 列出各来源约定版本 |
+| GET | `/api/login/conventions/{source_id}` | 查看可复核的约定快照 |
+| POST | `/api/login/events/classify` | 按来源约定分类并返回登录依据 |
+| POST | `/api/login/alerts/check` | 用实际有效候选计数，生成带依据告警 |
+| GET | `/api/login/alerts/{alert_id}/audit` | 核对参与原行、字段版本、矛盾原值与复核清单 |
+| GET | `/api/login/alerts/{alert_id}/handover` | 本轮能否完成：历史口径与下一轮真实计数 |
+| POST | `/api/login/corrections` | 值班员更正原行，只重算该事件及告警 |
+| POST | `/api/login/alerts/deliver` | 交付告警，字段核验端未确认时保留中断状态 |
+| POST | `/api/login/alerts/{alert_id}/resume` | 中断后恢复，不重发原告警、交付待交付修正 |
+| POST | `/api/login/alerts/{alert_id}/confirm` | 交班确认，同一告警只允许一次 |
+
+前端新增「登录告警依据」页（`/login_alerts`），可查看参与告警的原行与字段组、
+未计入原因、修正关联、交付/恢复结果与交班判定。
+
+`IngestPipeline.classify_events` 与 `IngestPipeline.check_anomaly` 遵守同一判定规则：
+分类时按来源生效条件和换名兼容规则给出登录事件；计数时只统计实际有效候选。
+
 
 ## 约定
 

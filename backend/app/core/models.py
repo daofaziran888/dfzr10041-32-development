@@ -226,6 +226,17 @@ class EventRecord:
     source_host: str
     store_partition: str = ""
     index_state: str = "已写入"
+    # ---- 登录动作换名与告警依据（可选，保持向后兼容） ----
+    # 只有经过来源约定判定的记录才带 login_verdict；老调用方不传约定时保持空串。
+    source_id: str = ""
+    raw_line: str = ""
+    line_number: int = 0
+    login_verdict: str = ""          # LOGIN / LOGOUT / ACCESS / UNKNOWN / CONFLICT / INACTIVE
+    login_evidence: dict[str, Any] = field(default_factory=dict)
+    review_reason: str = ""
+    effective: bool = True          # 是否可作为登录告警的实际有效候选
+    field_version: str = ""
+    convention_version: str = ""
 
 
 @dataclass

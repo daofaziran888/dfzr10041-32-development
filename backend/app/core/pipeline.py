@@ -16,6 +16,10 @@ from app.core.models import (
     LogEntry, LogFormat, LogSourceConfig, ParseResultStatus, ParseRule,
     QualityReport,
 )
+from app.core.login_convention import (
+    LOGIN, LOGOUT, LoginAlertEngine, LoginConventionRegistry, SourceConvention,
+    classify_with_convention, event_key,
+)
 
 # ---------- 预置日志来源配置 ----------
 
@@ -131,10 +135,19 @@ class IngestPipeline:
     6. 产出 ingest_metric 作为质量报告的数据源
     """
 
-    def __init__(self):
+    def __init__(self, login_registry: LoginConventionRegistry | None = None,
+                 login_engine: LoginAlertEngine | None = None):
         self._checkpoint_store: dict[str, BatchCheckpoint] = {}
         self._event_store: dict[str, list[EventRecord]] = {}
         self._fingerprint_seen: set[str] = set()
+        # 登录动作换名约定：来源生效条件 + 字段改名/取值转换。
+        # 未注入时保持旧行为（只按级别/action 做事件分类）。
+        self.login_registry = login_registry
+        self.login_engine = login_engine
+        self._login_records: dict[str, EventRecord] = {}
+
+    def attach_login_registry(self, registry: LoginConventionRegistry) -> None:
+        self.login_registry = registry
 
     # ---------- 数据流 1: log_source → parser_rule → ingest_job → event_store ----------
 
@@ -181,11 +194,14 @@ class IngestPipeline:
             processed.append(entry)
         return processed
 
-    def classify_events(self, entries: list[LogEntry]) -> list[EventRecord]:
+    def classify_events(self, entries: list[LogEntry],
+                        convention: SourceConvention | None = None) -> list[EventRecord]:
         """将解析后的日志条目按事件类型分类并生成 EventRecord。
 
         数据流入口：event_store ← 解析后的 LogEntry
-        分类依据：日志级别（app log → error/access）或来源标识
+        分类依据：日志级别（app log → error/access）或来源标识。
+        若配置了来源约定（或传入 ``convention``），登录判定完全遵循同一规则：
+        来源生效条件、字段改名、取值转换缺一不可，判定依据随事件一起保存。
         """
         records: list[EventRecord] = []
         host_counter: dict[str, int] = {}
@@ -207,9 +223,62 @@ class IngestPipeline:
                 source_host=host,
                 store_partition=partition,
                 index_state="已写入",
+                source_id=entry.source_id,
+                raw_line=entry.raw_line,
+                line_number=entry.line_number,
             )
+            self._apply_login_verdict(record, entry, convention)
             records.append(record)
         return records
+
+    def _login_registry(self) -> LoginConventionRegistry | None:
+        if self.login_registry is not None:
+            return self.login_registry
+        if self.login_engine is not None:
+            return self.login_engine.registry
+        return None
+
+    def _apply_login_verdict(self, record: EventRecord, entry: LogEntry,
+                             override: SourceConvention | None) -> None:
+        """把来源约定的登录判定写到 EventRecord；未配置约定时保持旧行为。"""
+        registry = self._login_registry()
+        if override is None and registry is None:
+            return
+        convention = override if override is not None else registry.active(entry.source_id)  # type: ignore[union-attr]
+        result = classify_with_convention(
+            convention, entry.source_id, entry.parsed_fields or {},
+        )
+        record.login_verdict = result["verdict"]
+        record.login_evidence = {
+            "field_group": result["field_group"],
+            "observations": result["observations"],
+            "review_reason": result["review_reason"],
+        }
+        record.review_reason = result["review_reason"]
+        record.effective = bool(result["effective"])
+        record.field_version = result["field_version"]
+        record.convention_version = result["convention_version"]
+
+        # 命中登录动作时归入认证事件；其它判定保留原事件类型。
+        if result["verdict"] in (LOGIN, LOGOUT):
+            record.event_type = PRESET_EVENT_TYPES["auth"]
+
+        key = event_key(entry.source_id, entry.line_number, record.record_id)
+        self._login_records[key] = record
+        if self.login_engine is not None:
+            event = self.login_engine.classify_entry(
+                source_id=entry.source_id,
+                line_number=entry.line_number,
+                raw_line=entry.raw_line,
+                fields=entry.parsed_fields or {},
+                record_id=record.record_id,
+                event_type_id=record.event_type.type_id,
+                convention=convention,
+            )
+            record.login_verdict = event.verdict
+            record.effective = event.effective
+            record.login_evidence["observations"] = event.observations
+            record.review_reason = event.review_reason
 
     def store_events(self, records: list[EventRecord]) -> int:
         """写入 event_store 并返回存储条数。"""
@@ -382,8 +451,20 @@ class IngestPipeline:
         """异常检测：统计指定事件类型数量，触发告警条件。
 
         对应 anomaly_rule 模块：事件分类→异常告警路径。
+        对认证事件（登录告警）只计实际有效候选：字段矛盾/未登记/非本来源
+        的记录即使事件类型相同也不参与计数，计数依据见 ``login_alert``。
         """
         matched = [r for r in records if r.event_type.type_id == event_type_id]
+        if event_type_id == PRESET_EVENT_TYPES["auth"].type_id and any(
+                r.login_verdict for r in records):
+            effective = [
+                r for r in matched
+                if r.login_verdict == LOGIN and r.effective
+            ]
+            if len(effective) > threshold:
+                for r in effective:
+                    r.parsed_fields["anomaly_alert"] = "triggered"
+            return effective
         if len(matched) > threshold:
             for r in matched:
                 r.parsed_fields["anomaly_alert"] = "triggered"
@@ -424,6 +505,53 @@ class IngestPipeline:
 
     def get_event_store(self) -> dict[str, list[EventRecord]]:
         return self._event_store
+
+    # ---------- 登录事件更正：只重算这一条事件及其告警 ----------
+
+    def apply_login_correction(
+        self,
+        *,
+        correction_id: str,
+        source_id: str,
+        new_field_values: dict[str, Any],
+        reason: str = "",
+        record_id: str = "",
+        line_number: int | None = None,
+    ) -> dict[str, Any]:
+        """值班员更正某条原行动作值：事件与告警一起重算，同批其它来源不动。
+
+        幂等重放由 LoginAlertEngine 按 correction_id 保证。
+        """
+        if self.login_engine is None:
+            return {"ok": False, "message": "未配置登录告警引擎"}
+        outcome = self.login_engine.correct(
+            correction_id=correction_id,
+            source_id=source_id,
+            new_field_values=new_field_values,
+            reason=reason,
+            record_id=record_id,
+            line_number=line_number,
+        )
+        if outcome.get("ok"):
+            event_key_value = outcome.get("recounted_event_keys", [""])[0]
+            record = self._login_records.get(event_key_value)
+            if record is not None:
+                corrected = outcome["event"]
+                record.login_verdict = corrected["verdict"]
+                record.effective = corrected["effective"]
+                record.parsed_fields.update(
+                    {k: v for k, v in new_field_values.items() if str(v).strip()}
+                )
+                record.login_evidence = {
+                    "field_group": corrected["field_group"],
+                    "observations": corrected["observations"],
+                    "review_reason": corrected["review_reason"],
+                }
+                record.review_reason = corrected["review_reason"]
+        return outcome
+
+    def get_login_records(self) -> list[EventRecord]:
+        return list(self._login_records.values())
 
     def get_checkpoints(self) -> list[BatchCheckpoint]:
         return list(self._checkpoint_store.values())
